@@ -1,129 +1,189 @@
-﻿# Moves completed downloads:
-# - Moves full folders when ready
-# - Moves loose files individually
-# - Skips in-use files
-# - Cleans up empty folders
-# Created: 2026-05-05
-$source = "C:\Users\YUDonno\Downloads\Completed"
+﻿$source = "C:\Users\YUDonno\Downloads\Completed"
 $dest   = "T:\test"
 $intervalSeconds = 60
+$logDir = "B:\Scripts\Working\logs"
 
-New-Item -ItemType Directory -Path $dest -Force | Out-Null
+if (!(Test-Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+}
+
+function Get-LogPath {
+    $date = Get-Date -Format "yyyy-MM-dd"
+    Join-Path $logDir "move-files-$date.log"
+}
+
+function Write-Log {
+    param ($message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "$timestamp - $message"
+    Write-Host $entry
+    Add-Content -Path (Get-LogPath) -Value $entry
+}
+
+function Format-Size {
+    param ([long]$bytes)
+    if ($bytes -ge 1GB) { "{0:N2} GB" -f ($bytes / 1GB) }
+    elseif ($bytes -ge 1MB) { "{0:N2} MB" -f ($bytes / 1MB) }
+    elseif ($bytes -ge 1KB) { "{0:N2} KB" -f ($bytes / 1KB) }
+    else { "$bytes Bytes" }
+}
+
+function Copy-WithProgress {
+    param ($sourcePath, $destPath)
+
+    $bufferSize = 4MB
+    $fileSize = (Get-Item $sourcePath).Length
+
+    $in  = [System.IO.File]::OpenRead($sourcePath)
+    $out = [System.IO.File]::Create($destPath)
+
+    $buffer = New-Object byte[] $bufferSize
+    $total = 0
+
+    while (($read = $in.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $out.Write($buffer, 0, $read)
+        $total += $read
+
+        $percent = [math]::Round(($total / $fileSize) * 100, 2)
+
+        Write-Progress `
+            -Activity "Moving file: $(Split-Path $sourcePath -Leaf)" `
+            -Status "$percent% ($(Format-Size $total) / $(Format-Size $fileSize))" `
+            -PercentComplete $percent
+    }
+
+    $in.Close()
+    $out.Close()
+}
 
 function Test-FileReady {
     param ($path)
     try {
-        $stream = [System.IO.File]::Open($path, 'Open', 'Read', 'None')
-        $stream.Close()
+        $s = [System.IO.File]::Open($path, 'Open', 'Read', 'None')
+        $s.Close()
         return $true
-    } catch {
-        return $false
-    }
+    } catch { return $false }
 }
 
 function Test-FolderReady {
     param ($folder)
-
-    $files = Get-ChildItem -Path $folder -File -Recurse -ErrorAction SilentlyContinue
+    $files = Get-ChildItem $folder -File -Recurse -ErrorAction SilentlyContinue
     if ($files.Count -eq 0) { return $false }
 
-    foreach ($file in $files) {
-        if ($file.LastWriteTime -gt (Get-Date).AddMinutes(-2)) { return $false }
-        if (-not (Test-FileReady $file.FullName)) { return $false }
+    foreach ($f in $files) {
+        if ($f.LastWriteTime -gt (Get-Date).AddMinutes(-2)) { return $false }
+        if (-not (Test-FileReady $f.FullName)) { return $false }
     }
-
     return $true
 }
 
+New-Item -ItemType Directory -Path $dest -Force | Out-Null
+$global:idleCounter = 0
+
+Write-Log "===== Script started ====="
+
 while ($true) {
 
-    Write-Host "`nScanning at $(Get-Date)..."
+    $cycleFiles = 0
+    $cycleFolders = 0
+    $cycleBytes = 0
 
     # -------------------------
-    # 1. MOVE COMPLETE FOLDERS
+    # FOLDER HANDLING
     # -------------------------
-    $folders = Get-ChildItem -Path $source -Directory -ErrorAction SilentlyContinue
+    $folders = Get-ChildItem $source -Directory
 
     foreach ($folder in $folders) {
 
-        if (-not (Test-FolderReady $folder.FullName)) {
-            Write-Host "Skipping folder (not ready): $($folder.Name)"
-            continue
-        }
+        if (-not (Test-FolderReady $folder.FullName)) { continue }
+
+        $destPath = Join-Path $dest $folder.Name
+        if (Test-Path $destPath) { continue }
+
+        Write-Log "START folder: $($folder.Name)"
 
         try {
-            $destPath = Join-Path $dest $folder.Name
+            $files = Get-ChildItem $folder.FullName -File -Recurse
+            $i = 0
 
-            if (Test-Path $destPath) {
-                Write-Host "Skipped folder (exists): $($folder.Name)"
-                continue
+            foreach ($file in $files) {
+                $i++
+
+                $rel = $file.FullName.Substring($source.Length).TrimStart("\")
+                $target = Join-Path $dest $rel
+                $dir = Split-Path $target
+
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+                Write-Log "  [$i/$($files.Count)] Moving: $($file.Name)"
+
+                Copy-WithProgress $file.FullName $target
+
+                Remove-Item $file.FullName -Force
+
+                $cycleFiles++
+                $cycleBytes += $file.Length
             }
 
-            Move-Item -Path $folder.FullName -Destination $destPath -Force
-            Write-Host "Moved folder: $($folder.Name)"
+            Remove-Item $folder.FullName -Force -Recurse
+
+            Write-Log "DONE folder: $($folder.Name)"
+
+            $cycleFolders++
         }
         catch {
-            Write-Host "Failed folder: $($folder.Name)"
-            Write-Host $_.Exception.Message
+            Write-Log "FAILED folder: $($folder.Name)"
+            Write-Log $_.Exception.Message
         }
     }
 
     # -------------------------
-    # 2. MOVE LOOSE FILES
+    # LOOSE FILES
     # -------------------------
-    $files = Get-ChildItem -Path $source -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
+    $files = Get-ChildItem $source -File -Recurse | Where-Object {
         $_.LastWriteTime -lt (Get-Date).AddMinutes(-2) -and
         (Test-FileReady $_.FullName)
     }
 
     foreach ($file in $files) {
 
-        $sourcePath = $file.FullName
+        $rel = $file.FullName.Substring($source.Length).TrimStart("\")
+        $destPath = Join-Path $dest $rel
+        $dir = Split-Path $destPath
 
-        if (!(Test-Path $sourcePath)) { continue }
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+        Write-Log "START file: $rel ($(Format-Size $file.Length))"
 
         try {
-            # Preserve relative structure
-            $relativePath = $sourcePath.Substring($source.Length).TrimStart("\")
-            $destPath = Join-Path $dest $relativePath
+            Copy-WithProgress $file.FullName $destPath
+            Remove-Item $file.FullName -Force
 
-            $destDir = Split-Path $destPath
-            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+            Write-Log "DONE file: $rel"
 
-            if (Test-Path $destPath) {
-                Write-Host "Skipped file (exists): $relativePath"
-                continue
-            }
-
-            Copy-Item -Path $sourcePath -Destination $destPath -Force
-
-            if ((Get-Item $destPath).Length -eq $file.Length) {
-                Remove-Item $sourcePath -Force
-                Write-Host "Moved file: $relativePath"
-            } else {
-                Write-Host "Verification failed: $relativePath"
-            }
+            $cycleFiles++
+            $cycleBytes += $file.Length
         }
         catch {
-            Write-Host "Failed file: $sourcePath"
-            Write-Host $_.Exception.Message
+            Write-Log "FAILED file: $rel"
+            Write-Log $_.Exception.Message
         }
     }
 
     # -------------------------
-    # 3. CLEAN EMPTY FOLDERS
+    # SUMMARY / IDLE
     # -------------------------
-    Get-ChildItem -Path $source -Directory -Recurse |
-    Sort-Object FullName -Descending |
-    ForEach-Object {
-        if (-not (Get-ChildItem $_.FullName -Force)) {
-            try {
-                Remove-Item $_.FullName -Force
-                Write-Host "Removed empty folder: $($_.FullName)"
-            } catch {}
+    if ($cycleFiles -gt 0 -or $cycleFolders -gt 0) {
+        Write-Log "Summary: $cycleFolders folders, $cycleFiles files, $(Format-Size $cycleBytes)"
+        $global:idleCounter = 0
+    }
+    else {
+        $global:idleCounter++
+        if ($global:idleCounter -ge 10) {
+            Write-Log "Idle: no activity in last $($global:idleCounter) cycles"
+            $global:idleCounter = 0
         }
     }
 
-    Write-Host "Waiting $intervalSeconds seconds..."
     Start-Sleep -Seconds $intervalSeconds
 }
