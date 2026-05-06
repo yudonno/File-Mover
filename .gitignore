@@ -6,6 +6,10 @@ logs/
 *.tmp
 *.temp
 
+# Runtime / generated files
+state.json
+daily-report.txt
+
 # PowerShell transcripts
 *.txt
 
