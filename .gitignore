@@ -2,9 +2,20 @@
 logs/
 *.log
 
-# Runtime files
-state.json
-daily-report.txt
-
-# Optional
+# Temp files
 *.tmp
+*.temp
+
+# PowerShell transcripts
+*.txt
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# VS Code
+.vscode/
+
+# PowerShell module build output (if you ever go that route)
+bin/
+obj/
