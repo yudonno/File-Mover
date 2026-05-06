@@ -1,0 +1,10 @@
+# Logs
+logs/
+*.log
+
+# Runtime files
+state.json
+daily-report.txt
+
+# Optional
+*.tmp
