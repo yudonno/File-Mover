@@ -1,215 +1,415 @@
 ﻿#requires -Version 7.0
 
+$ErrorActionPreference = "Stop"
+
+# =========================================================
+# CONFIG
+# =========================================================
+
 $source = "C:\Users\YUDonno\Downloads\Completed"
 $dest   = "\\yudonno-nas\Media\TV Shows\test"
-$baseDir = "B:\Scripts\Working"
 
-$logDir     = Join-Path $baseDir "logs"
-$stateFile  = Join-Path $baseDir "state.json"
-$reportFile = Join-Path $baseDir "daily-report.txt"
+$baseDir  = "B:\Scripts\Working"
+$logDir   = Join-Path $baseDir "logs"
+$debugLog = Join-Path $baseDir "debug.log"
 
-$intervalSeconds = 60
-$throttle = 4
+$folderQuietSeconds = 15
+$loopDelay = 5
+$pauseOnError = $false
+
+$ignoreExtensions = @(
+    ".part",
+    ".tmp",
+    ".crdownload",
+    ".!qb",
+    ".partial"
+)
+
+# =========================================================
+# STARTUP
+# =========================================================
 
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 New-Item -ItemType Directory -Path $dest -Force | Out-Null
 
-# -------- UTIL --------
-
-function Get-LogPath {
-    Join-Path $logDir ("move-files-" + (Get-Date -Format "yyyy-MM-dd") + ".log")
-}
+# =========================================================
+# LOGGING
+# =========================================================
 
 function Write-Log {
-    param($msg)
-    Add-Content (Get-LogPath) "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $msg"
+    param([string]$Message)
+
+    $logFile = Join-Path $logDir (
+        "move-files-" + (Get-Date -Format "yyyy-MM-dd") + ".log"
+    )
+
+    Add-Content -Path $logFile -Value (
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
+    )
 }
 
-function Format-Size {
-    param([long]$b)
-    if ($b -ge 1GB) { "{0:N2} GB" -f ($b/1GB) }
-    elseif ($b -ge 1MB) { "{0:N2} MB" -f ($b/1MB) }
-    else { "$b Bytes" }
+function Write-DebugLog {
+    param([string]$Message)
+
+    Add-Content -Path $debugLog -Value (
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
+    )
 }
 
-function Test-FileReady {
-    param($path)
+# =========================================================
+# HELPERS
+# =========================================================
+
+function Test-FileStable {
+    param([string]$Path)
+
     try {
-        $s = [System.IO.File]::Open($path,'Open','Read','None')
-        $s.Close()
-        return $true
-    } catch { return $false }
-}
 
-function Send-Alert {
-    param($msg)
-    Add-Type -AssemblyName System.Windows.Forms
-    [System.Windows.Forms.MessageBox]::Show($msg)
-}
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return $false
+        }
 
-function Update-State {
-    param($files,$folders,$bytes,$idle)
+        $size1 = (Get-Item -LiteralPath $Path).Length
 
-    @{
-        time = Get-Date
-        files = $files
-        folders = $folders
-        data = $bytes
-        idle = $idle
-    } | ConvertTo-Json | Set-Content $stateFile
-}
+        Start-Sleep -Milliseconds 750
 
-function Show-Console {
-    param($files,$folders,$bytes,$idle)
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return $false
+        }
 
-    Clear-Host
-    Write-Host "==== FILE MOVER ====" -ForegroundColor Cyan
-    Write-Host "Files   : $files"
-    Write-Host "Folders : $folders"
-    Write-Host "Data    : $(Format-Size $bytes)"
-    Write-Host "Idle    : $idle"
-}
+        $size2 = (Get-Item -LiteralPath $Path).Length
 
-# -------- WEB DASHBOARD --------
-
-Start-Job -ScriptBlock {
-    param($stateFile)
-
-    $listener = [System.Net.HttpListener]::new()
-    $listener.Prefixes.Add("http://+:8080/")
-    $listener.Start()
-
-    while ($true) {
-        $ctx = $listener.GetContext()
-        $res = $ctx.Response
-
-        $json = if (Test-Path $stateFile) {
-            Get-Content $stateFile -Raw
-        } else { "{}" }
-
-        $html = @"
-<html>
-<head><meta http-equiv='refresh' content='2'></head>
-<body style='background:#111;color:#0f0;font-family:Consolas'>
-<h2>File Mover</h2>
-<pre>$json</pre>
-</body>
-</html>
-"@
-
-        $buf = [Text.Encoding]::UTF8.GetBytes($html)
-        $res.OutputStream.Write($buf,0,$buf.Length)
-        $res.Close()
+        return ($size1 -eq $size2)
     }
+    catch {
+        return $false
+    }
+}
 
-} -ArgumentList $stateFile | Out-Null
+function Test-FolderReady {
+    param([string]$Folder)
 
-# -------- SESSION --------
+    try {
 
-$sessionFiles = 0
-$sessionFolders = 0
-$sessionBytes = 0
-$idleCounter = 0
+        $files = Get-ChildItem `
+            -LiteralPath $Folder `
+            -Recurse `
+            -File `
+            -ErrorAction Stop
 
-Write-Log "===== START ====="
+        foreach ($file in $files) {
 
-# -------- MAIN LOOP --------
+            if (-not (Test-FileStable $file.FullName)) {
+                return $false
+            }
+        }
+
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-FolderSize {
+    param([string]$Folder)
+
+    try {
+
+        $bytes = (
+            Get-ChildItem `
+                -LiteralPath $Folder `
+                -Recurse `
+                -File `
+                -ErrorAction SilentlyContinue |
+            Measure-Object Length -Sum
+        ).Sum
+
+        if (-not $bytes) {
+            $bytes = 0
+        }
+
+        return [math]::Round($bytes / 1GB, 2)
+    }
+    catch {
+        return 0
+    }
+}
+
+# =========================================================
+# TRACKING
+# =========================================================
+
+$folderTracker = New-Object 'System.Collections.Generic.Dictionary[string,datetime]'
+$processing = New-Object 'System.Collections.Generic.HashSet[string]'
+
+# =========================================================
+# STATS
+# =========================================================
+
+$stats = [PSCustomObject]@{
+    MovedFolders = 0
+    MovedFiles   = 0
+    Failed       = 0
+}
+
+function Show-Dashboard {
+
+    Write-Host ""
+    Write-Host "========== STATUS ==========" -ForegroundColor Cyan
+    Write-Host "Folders moved : $($stats.MovedFolders)"
+    Write-Host "Loose files   : $($stats.MovedFiles)"
+    Write-Host "Failures      : $($stats.Failed)"
+    Write-Host "Tracked items : $($folderTracker.Count)"
+    Write-Host "============================"
+    Write-Host ""
+}
+
+# =========================================================
+# PRELOAD
+# =========================================================
+
+Write-Host ""
+Write-Host "Preloading folders..." -ForegroundColor Yellow
+
+$existingFolders = Get-ChildItem `
+    -LiteralPath $source `
+    -Directory `
+    -ErrorAction SilentlyContinue
+
+foreach ($folder in $existingFolders) {
+    $folderTracker[$folder.FullName] = [datetime]::Now
+}
+
+Write-Host "Preload complete" -ForegroundColor Green
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+
+Write-Host ""
+Write-Host "Running (FINAL STABLE MODE)..." -ForegroundColor Green
 
 while ($true) {
 
-    $cycleFiles = 0
+    # -----------------------------------------------------
+    # DISCOVER NEW FOLDERS
+    # -----------------------------------------------------
 
-    # -------- PARALLEL FILES --------
-    $files = Get-ChildItem -LiteralPath $source -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
-        $_.LastWriteTime -lt (Get-Date).AddMinutes(-2) -and
-        (Test-FileReady $_.FullName)
+    $discoveredFolders = Get-ChildItem `
+        -LiteralPath $source `
+        -Directory `
+        -ErrorAction SilentlyContinue
+
+    foreach ($dir in $discoveredFolders) {
+
+        if (-not $folderTracker.ContainsKey($dir.FullName)) {
+
+            Write-Host ""
+            Write-Host "Discovered new folder:" -ForegroundColor Cyan
+            Write-Host "  $($dir.Name)"
+
+            $folderTracker[$dir.FullName] = [datetime]::Now
+        }
     }
 
-    if ($files.Count -gt 0) {
+    # -----------------------------------------------------
+    # PROCESS FOLDERS
+    # -----------------------------------------------------
 
-        $results = $files | ForEach-Object -Parallel {
+    foreach ($folder in @($folderTracker.Keys)) {
 
-            $file   = $_
-            $source = $using:source
-            $dest   = $using:dest
+        try {
 
-            try {
-                $rel = $file.FullName.Substring($source.Length).TrimStart("\")
-                $destPath = Join-Path $dest $rel
-                $dir = Split-Path $destPath
+            if ([string]::IsNullOrWhiteSpace($folder)) {
+                continue
+            }
 
-                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            if (-not (Test-Path -LiteralPath $folder)) {
 
-                Copy-Item -LiteralPath $file.FullName -Destination $destPath -Force
+                $folderTracker.Remove($folder)
 
-                if ((Get-Item -LiteralPath $destPath).Length -eq $file.Length) {
-                    Remove-Item -LiteralPath $file.FullName -Force
-                    return @{ ok=$true; name=$rel; size=$file.Length }
+                continue
+            }
+
+            if ($processing.Contains($folder)) {
+                continue
+            }
+
+            $lastSeen = $folderTracker[$folder]
+
+            $age = (Get-Date) - $lastSeen
+
+            if ($age.TotalSeconds -lt $folderQuietSeconds) {
+                continue
+            }
+
+            $processing.Add($folder) | Out-Null
+
+            if (-not (Test-FolderReady $folder)) {
+
+                $folderTracker[$folder] = [datetime]::Now
+
+                [void]$processing.Remove($folder)
+
+                continue
+            }
+
+            $relative = $folder.Replace($source, "").TrimStart("\")
+
+            $destPath = Join-Path $dest $relative
+
+            # =================================================
+            # MERGE MODE
+            # =================================================
+
+            if (Test-Path -LiteralPath $destPath) {
+
+                Write-Host ""
+                Write-Host "MERGING INTO EXISTING FOLDER" -ForegroundColor Yellow
+                Write-Host "  $relative"
+
+                $sourceFiles = Get-ChildItem `
+                    -LiteralPath $folder `
+                    -Recurse `
+                    -File `
+                    -ErrorAction SilentlyContinue
+
+                foreach ($srcFile in $sourceFiles) {
+
+                    try {
+
+                        $relativeFile = $srcFile.FullName.Substring(
+                            $folder.Length
+                        ).TrimStart("\")
+
+                        $targetFile = Join-Path $destPath $relativeFile
+
+                        $targetDir = Split-Path $targetFile -Parent
+
+                        New-Item `
+                            -ItemType Directory `
+                            -Path $targetDir `
+                            -Force | Out-Null
+
+                        if (Test-Path -LiteralPath $targetFile) {
+                            continue
+                        }
+
+                        Move-Item `
+                            -LiteralPath $srcFile.FullName `
+                            -Destination $targetFile `
+                            -ErrorAction Stop
+                    }
+                    catch {
+
+                        Write-DebugLog $_.Exception.Message
+                    }
                 }
 
-                return @{ ok=$false; name=$rel }
+                try {
 
-            } catch {
-                return @{ ok=$false; name=$file.FullName }
+                    Remove-Item `
+                        -LiteralPath $folder `
+                        -Force `
+                        -Recurse `
+                        -ErrorAction SilentlyContinue
+                }
+                catch {}
+
+                $stats.MovedFolders++
+
+                $folderTracker.Remove($folder)
+
+                [void]$processing.Remove($folder)
+
+                continue
             }
 
-        } -ThrottleLimit $throttle
+            # =================================================
+            # NORMAL MOVE
+            # =================================================
 
-        foreach ($r in $results) {
-            if ($r.ok) {
-                $sessionFiles++
-                $sessionBytes += $r.size
-                $cycleFiles++
-                Write-Log "Moved file: $($r.name) ($(Format-Size $r.size))"
-            } else {
-                Write-Log "FAILED file: $($r.name)"
-                Send-Alert "FAILED: $($r.name)"
-            }
+            $sizeGB = Get-FolderSize $folder
+
+            Write-Host ""
+            Write-Host "MOVING FOLDER" -ForegroundColor Green
+            Write-Host "  Name : $relative"
+            Write-Host "  Size : $sizeGB GB"
+
+            Move-Item `
+                -LiteralPath $folder `
+                -Destination $destPath `
+                -ErrorAction Stop
+
+            Write-Host "MOVE COMPLETE" -ForegroundColor Green
+
+            Write-Log "Moved folder: $relative ($sizeGB GB)"
+
+            $stats.MovedFolders++
+
+            $folderTracker.Remove($folder)
+
+            [void]$processing.Remove($folder)
+        }
+        catch {
+
+            Write-Host ""
+            Write-Host "=========== FOLDER ERROR ===========" -ForegroundColor Red
+            Write-Host $_
+            Write-Host ""
+
+            Write-DebugLog $_.Exception.Message
+
+            $stats.Failed++
+
+            [void]$processing.Remove($folder)
         }
     }
 
-    # -------- FOLDERS --------
-    Get-ChildItem -LiteralPath $source -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    # -----------------------------------------------------
+    # PROCESS LOOSE FILES
+    # -----------------------------------------------------
+
+    $looseFiles = Get-ChildItem `
+        -LiteralPath $source `
+        -File `
+        -ErrorAction SilentlyContinue
+
+    foreach ($file in $looseFiles) {
+
         try {
-            $destPath = Join-Path $dest $_.Name
-            if (!(Test-Path -LiteralPath $destPath)) {
-                Move-Item -LiteralPath $_.FullName -Destination $destPath
-                $sessionFolders++
-                Write-Log "Moved folder: $($_.Name)"
+
+            if ($ignoreExtensions -contains $file.Extension) {
+                continue
             }
-        } catch {
-            Write-Log "FAILED folder: $($_.Name)"
-            Send-Alert "FAILED folder: $($_.Name)"
+
+            if (-not (Test-FileStable $file.FullName)) {
+                continue
+            }
+
+            $destPath = Join-Path $dest $file.Name
+
+            if (Test-Path -LiteralPath $destPath) {
+                continue
+            }
+
+            Move-Item `
+                -LiteralPath $file.FullName `
+                -Destination $destPath `
+                -ErrorAction Stop
+
+            $stats.MovedFiles++
+        }
+        catch {
+
+            Write-DebugLog $_.Exception.Message
+
+            $stats.Failed++
         }
     }
 
-    # -------- CLEANUP --------
-    Get-ChildItem -LiteralPath $source -Directory -Recurse -ErrorAction SilentlyContinue |
-    ForEach-Object {
-        if (-not (Get-ChildItem -LiteralPath $_.FullName -Force)) {
-            Remove-Item -LiteralPath $_.FullName -Force
-        }
-    }
+    Show-Dashboard
 
-    # -------- DASHBOARD --------
-    if ($cycleFiles -eq 0) { $idleCounter++ } else { $idleCounter = 0 }
-
-    Update-State $sessionFiles $sessionFolders $sessionBytes $idleCounter
-    Show-Console $sessionFiles $sessionFolders $sessionBytes $idleCounter
-
-    if ($idleCounter -ge 10) {
-        Write-Log "Idle for $idleCounter cycles"
-        $idleCounter = 0
-    }
-
-    # -------- DAILY REPORT --------
-    $today = Get-Date -Format "yyyy-MM-dd"
-    $log = Join-Path $logDir "move-files-$today.log"
-
-    if (Test-Path $log) {
-        $count = (Select-String -Path $log -Pattern "Moved file").Count
-        Set-Content $reportFile "Date: $today`nFiles moved: $count"
-    }
-
-    Start-Sleep $intervalSeconds
+    Start-Sleep -Seconds $loopDelay
 }
